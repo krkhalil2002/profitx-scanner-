@@ -1,4 +1,4 @@
-# profitx-scanner-
+# profitx-scanner- (BEST IF VIEWED IN CODE FORM)
 What is it?
 A production-grade, fully AWS-native serverless stock scanner built for ProfitX. The system pulls market data from an external API, applies deterministic scanning rules, and exposes results to authenticated users via a REST API and frontend dashboard.
 ProfitX is built entirely on AWS serverless infrastructure — no EC2, no idle servers, no manual scaling. Scans run on a schedule at market open or on demand from the dashboard. Results are stored in DynamoDB and served through API Gateway to a static frontend hosted on S3 and CloudFront.

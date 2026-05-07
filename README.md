@@ -74,7 +74,7 @@ profitx-scanner/
     ├── architecture-diagram.png
     └── cost-breakdown.md
 ---------------------------------------------------------------------------------------------------------------------------------------
----
+
 
 ## Deploying the Project
 
@@ -121,7 +121,8 @@ pip install -r requirements.txt
 pytest tests/
 ```
 
----
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 
 ## CI/CD
 
@@ -132,7 +133,8 @@ All deployments are automated via GitHub Actions. No manual console deployments 
 - Terraform plan is reviewed before apply on every run
 - AWS credentials are stored as GitHub Secrets and never exposed in logs
 
----
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 
 ## Security
 
@@ -144,7 +146,8 @@ All deployments are automated via GitHub Actions. No manual console deployments 
 - No secrets are stored in code or Terraform files
 - Full audit trail of all invocations and errors in CloudWatch
 
----
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 
 ## API Reference
 
@@ -162,7 +165,8 @@ All requests require a valid Cognito JWT token in the Authorization header.
 
 For full API documentation including request and response formats see the [Architecture Design Document](docs/architecture-design-document.md).
 
----
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 
 ## Trade-offs
 
@@ -196,7 +200,8 @@ The frontend is hosted as a static site on S3 and served globally through CloudF
 **CI/CD — GitHub Actions + Terraform over Manual Deployments**
 All deployments are automated through GitHub Actions running Terraform. No manual console deployments are permitted. This ensures every change is repeatable, reviewed before it applies, and leaves a full audit trail in GitHub. The trade-off accepted is that the pipeline requires initial setup and ongoing maintenance.
 
----
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 
 ## Documentation
 
@@ -204,13 +209,12 @@ Full architecture design document including goals, scope, data design, system fl
 
 [docs/architecture-design-document.md](docs/architecture-design-document.md)
 
----
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 
 ## Cost Awareness
 
-ProfitX is designed to minimize cost through serverless architecture. There is no cost during idle periods — nights, weekends, and market holidays. A full cost breakdown by service is documented at:
-
-[docs/cost-breakdown.md](docs/cost-breakdown.md)
+ProfitX is designed to minimize cost through serverless architecture. There is no cost during idle periods — nights, weekends, and market holidays.
 
 
 ## Scanning Logic

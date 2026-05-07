@@ -158,6 +158,33 @@ Market data API keys are stored in AWS Secrets Manager rather than Lambda enviro
 Frontend Hosting — S3 + CloudFront over EC2
 The frontend is hosted as a static site on S3 and served globally through CloudFront rather than running on a server. This eliminates server cost entirely, provides global CDN performance, and fully decouples frontend availability from backend load. The trade-off accepted is that the frontend is limited to static assets — there is no server side rendering.
 
+
+
+## Scanning Logic
+
+### Overview
+The scanner evaluates a list of stock symbols against a set of deterministic filter criteria. Any symbol that meets all conditions is written to DynamoDB as a scan result.
+
+### Filter Criteria
+| Filter | Threshold | Reason |
+|--------|-----------|--------|
+| Gap % | > 4% | Filters out noise, captures meaningful price movement |
+| Volume | > 500,000 | Ensures sufficient liquidity |
+| RVOL | > 2.0 | Confirms unusual interest relative to average activity |
+| Float | < 50,000,000 | Lower float stocks produce larger moves on high volume |
+
+### Evaluation Logic
+Each Scanner Worker Lambda receives a batch of symbols and for each symbol:
+1. Fetches market data from the external API
+2. Evaluates the symbol against all four filters
+3. If all conditions are met — writes a Scan Result record to DynamoDB
+4. If any condition fails — symbol is skipped
+
+### Design Decisions
+- **Deterministic rules over ML** — rules are transparent, explainable, and consistent
+- **Thresholds chosen based on standard morning gapper criteria** — commonly used by momentum day traders to identify stocks in play at market open
+- **Asynchronous execution** — avoids API Gateway's 29-second timeout and enables parallel processing across multiple workers
+
 CI/CD — GitHub Actions + Terraform over Manual Deployments
 All deployments are automated through GitHub Actions running Terraform. No manual console deployments are permitted. This ensures every change is repeatable, reviewed before it applies, and leaves a full audit trail in GitHub. The trade-off accepted is that the pipeline requires initial setup and ongoing maintenance.
 

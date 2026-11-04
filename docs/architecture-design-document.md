@@ -1,1480 +1,364 @@
-ProfitX AWS Serverless Stock Scanner ADD
+ProfitX Stock Scanner: Architecture Design Document
+
+| | |
+|---|---|
+| **Project** | ProfitX AWS Serverless Stock Scanner |
+| **Status** | v1 implemented (single-Lambda scanner). Fan-out design planned |
+| **Repo** | `krkhalil2002/profitx-scanner-` |
+| **Environments** | dev, prod (same Terraform code, separate state) |
+
+---
+
+## 1. Overview
+
+ProfitX needs a way to find stocks that are "in play" at market open: stocks that gap up on unusually high volume with a small float. This system scans a list of tickers against deterministic rules, stores the matches, and shows them to authenticated users on a dashboard.
+
+It is built entirely from AWS managed services (no EC2), defined as code in Terraform, and deployed through GitHub Actions.
+
+## 2. Goals and Non-goals
+
+**Goals**
+- Filter symbols by gap %, volume, relative volume (RVOL), and float
+- Store every scan with a timestamp so results can be retrieved later
+- Let only authenticated users run scans and read results
+- Run a scan automatically at market open on weekdays
+- Deploy identically to dev and prod from code, with no console clicking
+- Keep idle cost near zero and document the cost
+- Log everything and alarm on failures
+
+**Non-goals (for v1)**
+- Real-time streaming quotes or intraday alerts
+- Order execution or any trading action
+- Machine-learning-based selection (rules are intentionally deterministic and explainable)
+- Public sign-up or multi-tenant billing
+- Scanning thousands of symbols per request (see section 10)
+
+## 3. Requirements Traceability
+
+| Requirement (project brief) | How it is met |
+|---|---|
+| Filter by gap %, volume, RVOL, float | `filters.py`, four thresholds, all must pass |
+| Store results with timestamp | DynamoDB scan META item (`created_at`) plus result items |
+| Authenticated retrieval | Cognito JWT authorizer on API Gateway |
+| Deployable to dev and prod | One Terraform root module, `envs/dev.tfvars` and `envs/prod.tfvars` |
+| Cost awareness documented | `docs/cost-breakdown.md` |
+| Scheduled scans | EventBridge Scheduler, 9:35 AM Eastern, Mon to Fri |
+| No console deployments, no hardcoded secrets | Terraform + GitHub Actions; Secrets Manager |
+| Least-privilege IAM | One role per Lambda, resource-scoped policies |
+| Logging | CloudWatch log groups (14-day retention), alarms |
+
+## 4. High-Level Architecture
+
+```mermaid
+flowchart LR
+  U[User browser] -->|HTTPS| CF[CloudFront]
+  CF -->|OAC| S3[(S3 private bucket)]
+  U -->|sign in| COG[Cognito user pool]
+  U -->|Bearer JWT| APIGW[API Gateway HTTP API]
+  APIGW -->|validate JWT| COG
+  APIGW -->|POST /scans| SC[Lambda: scanner]
+  APIGW -->|GET /scans/latest| RS[Lambda: results]
+  EB[EventBridge Scheduler] -->|9:35 ET Mon-Fri| SC
+  SC -->|fetch quotes| MKT[Market data API]
+  SC -->|read API key| SM[Secrets Manager]
+  SC -->|write| DDB[(DynamoDB)]
+  RS -->|query| DDB
+  SC -.logs.-> CW[CloudWatch]
+  RS -.logs.-> CW
+  CW -->|alarms| SNS[SNS email]
+```
+
+## 5. Components
+
+| Component | Responsibility | Notes |
+|---|---|---|
+| **CloudFront + S3** | Serve the static dashboard | Bucket is private; CloudFront reads it through Origin Access Control. HTTPS enforced. Caching disabled (two tiny files) |
+| **Cognito user pool** | Authenticate users, issue JWTs | Admin-created users only. 12+ character passwords. Browser client has no secret |
+| **API Gateway (HTTP API)** | Public API, JWT validation, throttling | 10 req/s steady, burst 20. CORS restricted to the CloudFront origin |
+| **Lambda: scanner** | Fetch data, apply filters, write results | Python 3.12, 256 MB, 25 s timeout. Triggered by API or Scheduler |
+| **Lambda: results** | Return the latest scan | Python 3.12, 128 MB, 10 s timeout. Read-only |
+| **DynamoDB** | Persist scans and results | On-demand, single table, TTL 30 days, point-in-time recovery in prod |
+| **EventBridge Scheduler** | Trigger scheduled scans | Time-zone aware (`America/New_York`). Disabled in dev |
+| **Secrets Manager** | Hold the market data API key | Terraform creates the empty secret; the value is set by CLI |
+| **CloudWatch + SNS** | Logs, alarms, notifications | Alarms on Lambda errors and API 5xx. Optional email subscription |
+| **AWS Budgets** | Cost guardrail | Emails at 80% of $5/month |
+| **Terraform** | All infrastructure | Remote state in S3 with lockfile locking |
+| **GitHub Actions** | Test and deploy | OIDC to AWS, no stored keys |
+
+### Code layout
+
+```
+backend/functions/scanner/
+  handler.py     Lambda entry point, input validation, DynamoDB writes
+  filters.py     Pure scan rules (no AWS calls)
+  providers.py   Market data providers (mock, FMP)
+backend/functions/results/
+  handler.py     Latest-scan query
+```
+
+The scan rules are kept as pure functions in their own module so they can be unit tested without any AWS dependency.
+
+## 6. Data Design
 
+### 6.1 Access patterns
 
+| # | Pattern | Frequency |
+|---|---|---|
+| 1 | Get the most recent scan | Every dashboard load |
+| 2 | Get all results for a scan | Every dashboard load |
+| 3 | Write a scan summary and its results | Per scan |
+| 4 | Expire old data automatically | Continuous |
 
-\- Overview
+Because the patterns are few and known in advance, DynamoDB fits well. Keys are designed from these patterns.
 
+### 6.2 Table: `profitx-<env>-table`
 
+| Attribute | Type | Purpose |
+|---|---|---|
+| `pk` | String (partition key) | `SCAN#<scan_id>` |
+| `sk` | String (sort key) | `META` or `RESULT#<symbol>` |
+| `gsi1pk` | String | Constant `SCANS`, set on META items only |
+| `gsi1sk` | String | ISO timestamp, set on META items only |
+| `expires_at` | Number | Epoch seconds; DynamoDB TTL attribute |
 
-Purpose: Design, build, deploy, and document a production-grade, fully AWS-native serverless stock scanner for ProfitX.
+**Item types**
 
+| Item | pk | sk | Attributes |
+|---|---|---|---|
+| Scan summary | `SCAN#a1b2c3d4e5f6` | `META` | `scan_id`, `created_at`, `triggered_by`, `scanned`, `matched`, `errors`, `filters`, `gsi1pk`, `gsi1sk` |
+| Scan result | `SCAN#a1b2c3d4e5f6` | `RESULT#TSLA` | `symbol`, `price`, `gap_pct`, `volume`, `rvol`, `float` |
 
+**How each pattern is served**
 
-Goals:
+| Pattern | Operation |
+|---|---|
+| Latest scan | Query `gsi1` where `gsi1pk = "SCANS"`, descending, `Limit = 1` |
+| Results of a scan | Query base table where `pk = SCAN#<id>` and `sk begins_with RESULT#` |
+| Write a scan | `BatchWriteItem` of the META item plus result items |
+| Expiry | TTL on `expires_at` (30 days after creation) |
 
+Only META items carry the `gsi1` keys, so the index is small and holds exactly one entry per scan.
 
+## 7. API Design
 
-\- Enhanced scalability, able to handle spikes in scan requests without performance degradation
+All endpoints require `Authorization: Bearer <Cognito ID token>`. API Gateway validates the token's signature, issuer, audience, and expiry before invoking any Lambda. Requests without a valid token receive `401` and never reach Lambda.
 
-\- Low latency, return scan results within an acceptable window
+### POST /scans
 
-\- Maintainability, scanning logic should be modular so new filters and indicators can be added without rearchitecting
+Runs a scan immediately and returns the result.
 
-\- Security, protects any user data as well as contain API keys for market data providers
+**Request body (optional).** Any subset of the four filters, all numbers >= 0:
 
+```json
+{ "min_gap_pct": 6, "min_volume": 750000, "min_rvol": 2.5, "max_float": 30000000 }
+```
 
+**Response 200**
 
-Scope:
-
-
-
-\- Included:
-
-&#x20; - market ingestion
-
-&#x20; - Deterministic scanning logic
-
-&#x20; - Authenticated user access via Cognito
-
-&#x20; - Scheduled and on-demand scans
-
-&#x20; - Frontend dashboard hosted on S3 + CloudFront
-
-&#x20; - Full IaC via Terraform + CI/CD via GitHub Actions
-
-\- Not included:
-
-&#x20; - Trade execution
-
-&#x20; - Portfolio management
-
-&#x20; - Backtesting
-
-&#x20; - Real-time streaming (WebSocket)
-
-&#x20; - AI summaries (stretch goal, not core)
-
-
-
-\- Requirements
-
-
-
-Functional Requirements "what does it do?" :
-
-
-
-\- Filter by gap %, volume, RVOL, float
-
-\- Store scan results with timestamp
-
-\- Allow authenticated users to retrieve results
-
-\- Be deployable in dev and prod environments
-
-\- Have cost awareness documented
-
-
-
-Non-Functional Requirements "how well does it do it?" :
-
-
-
-\- No hardcoded secrets (Secrets Manager)
-
-\- Least-privilege IAM policies
-
-\- Full logging via CloudWatch
-
-\- No EC2 - serverless only
-
-\- Cost-optimized (pay-per-invocation)
-
-
-
-\- High-Level Architecture
-
-
-
-\- Flow:
-
-&#x20; - API Gateway → Lambda → DynamoDB
-
-\- EventBridge for scheduled scans
-
-\- Cognito for auth
-
-\- S3 + CloudFront for frontend
-
-\- Secrets Manager for API keys
-
-\- CloudWatch for logging
-
-\- Terraform for IaC
-
-\- GitHub Actions for CI/CD
-
-
-
-\- System Components
-
-
-
-\- API Gateway
-
-&#x20; - Serves as the entry point for all client requests
-
-&#x20; - Routes HTTP requests to the appropriate Lambda function
-
-&#x20; - Handles request validation and throttling
-
-&#x20; - Why?: Fully managed, scales automatically, integrates natively with Lambda and Cognito
-
-\- AWS Lambda
-
-&#x20; - Executes the core scanning logic
-
-&#x20; - Separate functions for: triggering scans, processing symbols, returning results
-
-&#x20; - Why?: No idle cost, scales per request, perfect for event-driven workloads
-
-\- Amazon DynamoDB
-
-&#x20; - Stores scan results with timestamps
-
-&#x20; - Stores user scan configurations
-
-&#x20; - Why?: Serverless, no provisioning, fast single-digit millisecond reads, scales automatically - vs RDS which requires a running instance
-
-\- Amazon EventBridge
-
-&#x20; - Triggers scheduled scans on a defined cron schedule (e.g., market open/close)
-
-&#x20; - Why?: Native AWS scheduler, integrates directly with Lambda, no server needed
-
-\- Amazon Cognito
-
-&#x20; - Handles user authentication and authorization
-
-&#x20; - Issues JWT tokens validated by API Gateway before requests reach Lambda
-
-&#x20; - Why?: Fully managed auth, no custom auth server needed
-
-\- S3 + CloudFront
-
-&#x20; - S3 hosts the static frontend dashboard files
-
-&#x20; - CloudFront serves as the CDN layer for low-latency global delivery
-
-&#x20; - Why?: Cheap, scalable static hosting with built-in caching and HTTPS
-
-\- AWS Secrets Manager
-
-&#x20; - Stores market data API keys securely
-
-&#x20; - Lambda retrieves secrets at runtime, never hardcoded
-
-&#x20; - Why?: Prevents credential exposure in code or environment variables
-
-\- CloudWatch
-
-&#x20; - Captures Lambda logs, errors, and execution metrics
-
-&#x20; - Alerts on failures or performance degradation
-
-&#x20; - Why?: Native AWS observability, zero setup for Lambda integration
-
-\- IAM
-
-&#x20; - Controls permissions for every service-to-service interaction
-
-&#x20; - Each Lambda function gets its own least-privilege role
-
-&#x20; - Why?: Security boundary - no function can access resources it doesn't need
-
-\- Terraform
-
-&#x20; - Defines all infrastructure as code
-
-&#x20; - Manages dev and prod environments separately
-
-&#x20; - Why?: Repeatable, version-controlled deployments - no console-click infrastructure
-
-\- GitHub Actions
-
-&#x20; - CI/CD pipeline that runs tests and deploys via Terraform on push
-
-&#x20; - Why?: Automates deployment, enforces standards, integrates with your GitHub repo
-
-\- External Market Data API
-
-&#x20; - Third-party provider supplying price, volume, float, and RVOL data
-
-&#x20; - System depends on this as its data source
-
-
-
-\- Data Design
-
-
-
-\- Database: DynamoDB
-
-&#x20; - Why DB over RDS?: DynamoDB was chosen over RDS because it is fully serverless, requires no idle instance, scales automatically, and fits the key-based lookup patterns of this system.
-
-
-
-&#x20; 5.1. Data Entries
-
-
-
-\- Scan Result:
-
-
-
-| Field           | Type   | Description                                           |
-
-| --------------- | ------ | ----------------------------------------------------- |
-
-| P(rimary) K(ey) | String | SCAN#\&lt;scanID\&gt;                                   |
-
-| ---             | ---    | ---                                                   |
-
-| S(ort) K(ey)    | String | SYMBOL#\&lt;ticker\&gt;                                 |
-
-| ---             | ---    | ---                                                   |
-
-| ticker          | String | Stock symbol (e.g. AAPL)                              |
-
-| ---             | ---    | ---                                                   |
-
-| scanID          | String | ID of the parent scan job                             |
-
-| ---             | ---    | ---                                                   |
-
-| timestamp       | String | ISO 8601 datetime of scan execution                   |
-
-| ---             | ---    | ---                                                   |
-
-| price           | Number | Stock Price at time of scan                           |
-
-| ---             | ---    | ---                                                   |
-
-| volume          | Number | Volume at the time of scan                            |
-
-| ---             | ---    | ---                                                   |
-
-| rvol            | Number | Relative Volume                                       |
-
-| ---             | ---    | ---                                                   |
-
-| float           | Number | Share float                                           |
-
-| ---             | ---    | ---                                                   |
-
-| gapPercent      | Number | Gap percentage                                        |
-
-| ---             | ---    | ---                                                   |
-
-| ttl             | Number | Epoch timestamp - record auto-expires after this date |
-
-| ---             | ---    | ---                                                   |
-
-
-
-\- Scan Job:
-
-
-
-| Field       | Type   | Description                             |
-
-| ----------- | ------ | --------------------------------------- |
-
-| PK          | String | JOB#\&lt;jobId\&gt;                       |
-
-| ---         | ---    | ---                                     |
-
-| SK          | String | METADATA                                |
-
-| ---         | ---    | ---                                     |
-
-| jobID       | String | Unique scan job identifier              |
-
-| ---         | ---    | ---                                     |
-
-| triggeredBy | String | "scheduled" or "user"                   |
-
-| ---         | ---    | ---                                     |
-
-| status      | String | pending/running/complete/<br><br>failed |
-
-| ---         | ---    | ---                                     |
-
-| criteria    | Map    | Filter values used in this scan         |
-
-| ---         | ---    | ---                                     |
-
-| startTime   | String | ISO 8601 start timestamp                |
-
-| ---         | ---    | ---                                     |
-
-| endTime     | String | ISO 8601 end timestamp                  |
-
-| ---         | ---    | ---                                     |
-
-| resultCount | Number | Number of symbols that matched          |
-
-| ---         | ---    | ---                                     |
-
-
-
-\- User Scan Configuration:
-
-
-
-| Field      | Type   | Description                                 |
-
-| ---------- | ------ | ------------------------------------------- |
-
-| PK         | String | USER#\&lt;userId\&gt;                         |
-
-| ---        | ---    | ---                                         |
-
-| SK         | String | CONFIG#\&lt;configId\&gt;                     |
-
-| ---        | ---    | ---                                         |
-
-| userId     | String | Cognito user ID                             |
-
-| ---        | ---    | ---                                         |
-
-| configName | String | User-defined name for this preset           |
-
-| ---        | ---    | ---                                         |
-
-| filters    | Map    | minGapPercent, minVolume, maxFloat, minRVOL |
-
-| ---        | ---    | ---                                         |
-
-| createdAt  | String | ISO 8601 creation timestamp                 |
-
-| ---        | ---    | ---                                         |
-
-| lastRunAt  | String | ISO 8601 timestamp of last execution        |
-
-| ---        | ---    | ---                                         |
-
-
-
-\- Access Patterns:
-
-
-
-| Access Pattern                   | Key Condition                                               |
-
-| -------------------------------- | ----------------------------------------------------------- |
-
-| Get all results for a scan       | PK = SCAN#\&lt;scanId\&gt;                                    |
-
-| ---                              | ---                                                         |
-
-| Get one symbol within a scan     | PK = SCAN#\&lt;scanId\&gt;,<br><br>SK = SYMBOL#\&lt;ticker\&gt; |
-
-| ---                              | ---                                                         |
-
-| Get scan job metadata            | PK = JOB#\&lt;jobId\&gt;,<br><br>SK = METADATA                |
-
-| ---                              | ---                                                         |
-
-| Get all saved configs for a user | PK = USER#\&lt;userId\&gt;,<br><br>SK begins\_with CONFIG#     |
-
-| ---                              | ---                                                         |
-
-| Get most recent scan results     | GSI on timestamp, sorted descending                         |
-
-| ---                              | ---                                                         |
-
-
-
-\- Data Flow:
-
-
-
-Market Data API (external)
-
-
-
-↓
-
-
-
-Lambda - Scan Worker (fetches + evaluates symbols)
-
-
-
-↓
-
-
-
-DynamoDB - writes scan results + updates scan job status
-
-
-
-↓
-
-
-
-Lambda - Results handler (reads from DynamoDB on request)
-
-
-
-↓
-
-
-
-API Gateway → Frontend Dashboard
-
-
-
-\- API Design
-
-
-
-\- Authentication
-
-&#x20; - All API requests must include a valid JWT token in the Authorization header, issued by Amazon Cognito upon successful user login.
-
-&#x20; - Authorization: Bearer \&lt;cognito\_jwt\_token\&gt;
-
-\- Base URL
-
-&#x20; - Where stage is either dev or prod depending on the deployment environment.
-
-&#x20; - https://\&lt;api-gateway-id\&gt;.execute-api.\&lt;region\&gt;.\[amazonaws.com/](http://amazonaws.com/)\&lt;stage\&gt;
-
-\- Endpoints
-
-&#x20; - \*\*Trigger a Manual Scan\*\*:
-
-&#x20; - Triggers an on-demand stock scan using the provided filter criteria. Creates a new scan job and returns the job ID. Results are written to DynamoDB asynchronously.
-
-&#x20; - POST /scans
-
-&#x20; - JSON ex:
-
-&#x20;   - Request Body:
-
-
-
+```json
 {
-
-
-
-"filters": {
-
-
-
-"minGapPercent": 2.5,
-
-
-
-"minVolume": 1000000,
-
-
-
-"maxFloat": 50000000,
-
-
-
-"minRVOL": 2.0
-
-
-
+  "scan": {
+    "scan_id": "a1b2c3d4e5f6",
+    "created_at": "2026-11-04T14:35:02.114+00:00",
+    "triggered_by": "9f1c...-cognito-sub",
+    "scanned": 40,
+    "matched": 3,
+    "errors": 0,
+    "filters": { "min_gap_pct": 4, "min_volume": 500000, "min_rvol": 2, "max_float": 50000000 }
+  },
+  "results": [
+    { "symbol": "TSLA", "price": 12.4, "gap_pct": 7.31, "volume": 1820000, "rvol": 3.12, "float": 22000000 }
+  ]
 }
+```
+
+**Response 400** for invalid input (unknown key, non-numeric value, negative value, malformed JSON):
+
+```json
+{ "error": "min_rvol must be a number" }
+```
+
+### GET /scans/latest
+
+Returns the most recent scan and its matches, sorted by `gap_pct` descending. Same shape as the POST response. If no scan exists yet:
+
+```json
+{ "scan": null, "results": [] }
+```
+
+### Planned endpoints
+
+`GET /scans`, `GET /scans/{scanId}`, and `/configs` (save, list, delete scan configurations). See section 16.
+
+## 8. System Flows
+
+### 8.1 Manual scan
+
+```mermaid
+sequenceDiagram
+  actor User
+  participant FE as Dashboard
+  participant COG as Cognito
+  participant API as API Gateway
+  participant SC as scanner Lambda
+  participant MKT as Market data
+  participant DB as DynamoDB
 
+  User->>FE: Enter username and password
+  FE->>COG: InitiateAuth (USER_PASSWORD_AUTH)
+  COG-->>FE: ID token (JWT)
+  User->>FE: Click Run scan
+  FE->>API: POST /scans + Bearer token
+  API->>API: Validate JWT
+  API->>SC: Invoke
+  loop each symbol
+    SC->>MKT: Fetch quote and float
+    SC->>SC: Apply filters
+  end
+  SC->>DB: BatchWrite META + RESULT items
+  SC-->>API: 200 { scan, results }
+  API-->>FE: 200
+  FE-->>User: Render table
+```
 
+### 8.2 Scheduled scan
 
-}
+EventBridge Scheduler invokes the scanner directly at 9:35 AM Eastern, Monday to Friday, with the payload `{"source": "schedule"}`. The scanner detects the absence of an API request context, uses the default filters, and records `triggered_by = "schedule"`. The dashboard shows these results the next time it loads `GET /scans/latest`.
 
+### 8.3 Deployment
 
-
-\- - - Response:
-
-
-
-{
-
-
-
-"jobId": "abc123",
-
-
-
-"status": "pending",
-
-
-
-"startTime": "2024-03-15T09:30:00Z"
-
-
-
-}
-
-
-
-\- - \*\*Get Recent Scan Jobs\*\*:
-
-&#x20;   - Returns a list of recent scan job records for the authenticated user, sorted by most recent first.
-
-&#x20;   - GET /scans
-
-&#x20;   - JSON ex:
-
-&#x20;     - Response:
-
-
-
-{
-
-
-
-"jobs": \\\[
-
-
-
-{
-
-
-
-"jobId": "abc123",
-
-
-
-"status": "complete",
-
-
-
-"triggeredBy": "user",
-
-
-
-"startTime": "2024-03-15T09:30:00Z",
-
-
-
-"endTime": "2024-03-15T09:30:04Z",
-
-
-
-"resultCount": 12
-
-
-
-}
-
-
-
-\\]
-
-
-
-}
-
-
-
-\- - \*\*Get Results for a specific scan\*\*:
-
-&#x20;   - Returns all stock symbols that matched the filters for a given scan job.
-
-&#x20;   - Path Parameter:
-
-
-
-| Parameter | Type   | Description                       |
-
-| --------- | ------ | --------------------------------- |
-
-| scanID    | String | The ID of the scan job to retrive |
-
-| ---       | ---    | ---                               |
-
-
-
-\- - GET /scans/{scanId} - JSON ex:
-
-
-
-Response:
-
-
-
-{
-
-
-
-"scanId": "abc123",
-
-
-
-"timestamp": "2024-03-15T09:30:00Z",
-
-
-
-"results": \\\[
-
-
-
-{
-
-
-
-"ticker": "TSLA",
-
-
-
-"price": 185.42,
-
-
-
-"volume": 4200000,
-
-
-
-"rvol": 3.2,
-
-
-
-"float": 3180000000,
-
-
-
-"gapPercent": 4.1
-
-
-
-}
-
-
-
-\\]
-
-
-
-}
-
-
-
-\- - \*\*Get latest scan results:\*\*
-
-&#x20;   - Returns the results of the most recently completed scan. Uses the DynamoDB GSI on timestamp to retrieve the latest record.
-
-&#x20;   - GET /scans/latest
-
-&#x20;     - JSON ex:
-
-
-
-Response:
-
-
-
-{
-
-
-
-"scanId": "abc123",
-
-
-
-"timestamp": "2024-03-15T09:30:00Z",
-
-
-
-"results": \\\[...\\]
-
-
-
-}
-
-
-
-\- - Save a user scan configuration:
-
-&#x20;   - Saves a named scan filter preset for the authenticated user.
-
-&#x20;   - POST /configs
-
-&#x20;     - JSON ex:
-
-
-
-Request body:
-
-
-
-{
-
-
-
-"configName": "Morning Gapper Setup",
-
-
-
-"filters": {
-
-
-
-"minGapPercent": 3.0,
-
-
-
-"minVolume": 500000,
-
-
-
-"maxFloat": 20000000,
-
-
-
-"minRVOL": 1.5
-
-
-
-}
-
-
-
-}
-
-
-
-Response:
-
-
-
-{
-
-
-
-"configId": "cfg456",
-
-
-
-"configName": "Morning Gapper Setup",
-
-
-
-"createdAt": "2024-03-15T08:00:00Z"
-
-
-
-}
-
-
-
-\- - \*\*Get all saved configurations:\*\*
-
-&#x20;   - Returns all saved scan configurations for the authenticated user.
-
-&#x20;   - GET /configs
-
-&#x20;     - JSON ex:
-
-
-
-Response:
-
-
-
-{
-
-
-
-"configs": \\\[
-
-
-
-{
-
-
-
-"configId": "cfg456",
-
-
-
-"configName": "Morning Gapper Setup", "filters": {
-
-
-
-"minGapPercent": 3.0,
-
-
-
-"minVolume": 500000,
-
-
-
-"maxFloat": 20000000,
-
-
-
-"minRVOL": 1.5
-
-
-
-},
-
-
-
-"createdAt": "2024-03-15T08:00:00Z",
-
-
-
-"lastRunAt": "2024-03-15T09:30:00Z"
-
-
-
-}
-
-
-
-\\]
-
-
-
-}
-
-
-
-\- - \*\*Delete a saved configuration:\*\*
-
-&#x20;   - Deletes a saved scan configuration by ID.
-
-&#x20;   - DELETE /configs/{configId}
-
-&#x20;   - Path Parameter
-
-
-
-| Parameter | Type   | Description                           |
-
-| --------- | ------ | ------------------------------------- |
-
-| configID  | string | The ID of the configuration to delete |
-
-| ---       | ---    | ---                                   |
-
-
-
-\- - - JSON ex:
-
-
-
-Response:
-
-
-
-{
-
-
-
-"message": "Configuration deleted successfully." }
-
-
-
-\- - \*\*Error Handling:\*\*
-
-&#x20;   - All endpoints return a consistent error response format:
-
-&#x20;     - JSON ex:
-
-
-
-{
-
-
-
-"error": {
-
-
-
-"code": "ERROR\_CODE",
-
-
-
-"message": "Human readable description of what went wrong."
-
-
-
-}
-
-
-
-}
-
-
-
-\- - - Standard Error Codes:
-
-
-
-| HTTP Status | Code           | Meaning                                         |
-
-| ----------- | -------------- | ----------------------------------------------- |
-
-| 400         | BAD\_REQUEST    | Missing or invalid request parameters           |
-
-| ---         | ---            | ---                                             |
-
-| 401         | UNAUTHORIZED   | Missing or invalid Cognito JWT token            |
-
-| ---         | ---            | ---                                             |
-
-| 403         | FORBIDDEN      | User does not have permission for this resource |
-
-| ---         | ---            | ---                                             |
-
-| 404         | NOT\_FOUND      | The requested scan or config does not exist     |
-
-| ---         | ---            | ---                                             |
-
-| 500         | INTERNAL\_ERROR | Unexpected server error - logged to CloudWatch  |
-
-| ---         | ---            | ---                                             |
-
-
-
-\- System Flow
-
-
-
-\- Scheduled Scan Flow - This flow runs automatically on a defined schedule using EventBridge. No user action is required:
-
-
-
-\- EventBridge triggers Lambda Scan Orchestrator on a cron schedule (e.g. weekdays at 9:30 AM EST - market open)
-
-\- Scan Orchestrator reads default scan criteria and generates a list of stock symbols to evaluate
-
-\- Orchestrator creates a new Scan Job record in DynamoDB with status = "pending"
-
-\- Orchestrator fans out - invokes multiple Lambda Scanner Worker functions in parallel, each responsible for a batch of symbols
-
-\- Each Scanner Worker:
-
-
-
-a. Fetches market data from the external Market Data API
-
-
-
-b. Evaluates each symbol against the filter criteria (gap %, volume, RVOL, float)
-
-
-
-c. Writes matching symbols as Scan Result records to DynamoDB
-
-
-
-\- Once all workers complete, Scan Job status is updated to "complete" with an endTime and resultCount
-
-\- Results are now available for retrieval via the API
-
-
-
-\- Manual Scan Flow - This flow is triggered by an authenticated user from the frontend dashboard:
-
-
-
-\- User submits scan criteria from the frontend dashboard
-
-\- Frontend sends POST /scans request to API Gateway with filter parameters in the request body
-
-\- API Gateway validates the Cognito JWT token
-
-\- If token is invalid - request is rejected with 401 Unauthorized If token is valid - request is forwarded to Lambda
-
-\- Lambda Scan Orchestrator receives the request, creates a new Scan Job record in DynamoDB with status = "pending", and returns 202 Accepted with the jobId to the frontend
-
-\- Orchestrator fans out - invokes Lambda Scanner Worker functions in parallel for each batch of symbols
-
-\- Each Scanner Worker:
-
-
-
-a. Fetches market data from the external Market Data API
-
-
-
-b. Evaluates each symbol against the submitted filter criteria
-
-
-
-c. Writes matching symbols as Scan Result records to DynamoDB
-
-
-
-\- Scan Job status is updated to "complete"
-
-\- Frontend polls GET /scans/{scanId} until status = "complete" then displays results to the user
-
-
-
-\- Results Retrieval flow - This flow is triggered when a user requests to view scan results from the dashboard:
-
-
-
-\- User opens the dashboard or requests a specific scan
-
-\- Frontend sends GET /scans/latest or GET /scans/{scanId} to API Gateway with a valid Cognito JWT token
-
-\- API Gateway validates the token and forwards the request to the Results Lambda function
-
-\- Results Lambda queries DynamoDB:
-
-
-
-\\- For latest results: queries GSI on timestamp descending
-
-
-
-\\- For specific scan: queries PK = SCAN#\&lt;scanId\&gt;
-
-
-
-\- DynamoDB returns matching records
-
-\- Lambda formats the response and returns it to API Gateway
-
-\- API Gateway returns the response to the frontend
-
-\- Frontend renders the list of matching stock symbols and their data to the user
-
-
-
-\- Authentication flow - This flow describes how a user logs in and obtains access to the API:
-
-
-
-\- User enters credentials on the frontend login screen
-
-\- Frontend sends credentials to Amazon Cognito
-
-\- Cognito validates the credentials against the user pool
-
-\- If invalid - Cognito returns an authentication error
-
-
-
-If valid - Cognito issues a JWT access token
-
-
-
-\- Frontend stores the JWT token and includes it in the Authorization header of every subsequent API request
-
-\- API Gateway validates the token on each request before allowing it to reach Lambda
-
-\- Token expires after a defined period - user is prompted to log in again
-
-
-
-\- Error Flow - This flow describes what happens when something goes wrong during a scan.
-
-
-
-\- A Scanner Worker Lambda encounters an error
-
-
-
-(e.g. market data API is unavailable, timeout, bad response)
-
-
-
-\- Lambda logs the full error details to CloudWatch
-
-\- The failed invocation is retried automatically up to the configured retry limit
-
-\- If all retries fail:
-
-
-
-\\- The Scan Job status is updated to "failed" in DynamoDB
-
-
-
-\\- The error is logged to CloudWatch with the jobId for debugging
-
-
-
-\- The frontend receives a failed status on the next poll and displays an appropriate error message to the user
-
-
-
-8\\. Scalability \& Performance
-
-
-
-\- AWS Lambda:
-
-
-
-Lambda scales automatically by creating new function instances in response to incoming requests. Each invocation runs in its own isolated environment. There is no server to provision or manage.
-
-
-
-\- - Concurrent executions scale up automatically as demand increases
-
-&#x20;   - The Scan Orchestrator fans out work to multiple Scanner Worker functions running in parallel, allowing the system to process large symbol lists significantly faster than sequential processing
-
-&#x20;   - Lambda scales back down to zero when there are no invocations, meaning there is no cost during idle periods such as nights, weekends, and market holidays
-
-\- API Gateway:
-
-
-
-API Gateway scales automatically with no configuration required. It handles thousands of concurrent requests without any manual scaling intervention.
-
-
-
-\- - Throttling limits are configured to protect downstream Lambda functions from being overwhelmed
-
-&#x20;   - Request and response caching can be enabled at the API Gateway level for frequently requested data such as the latest scan results, reducing Lambda invocations and latency
-
-\- Amazon DynamoDB
-
-
-
-DynamoDB is a fully serverless database that scales horizontally without downtime.
-
-
-
-\- - On-demand capacity mode is used so the table scales read and write throughput automatically based on actual traffic
-
-&#x20;   - No capacity planning is required - DynamoDB handles traffic spikes such as market open surges without intervention
-
-&#x20;   - The single-table design minimizes the number of read and write operations required per scan result
-
-&#x20;   - TTL is used to automatically expire old scan results, keeping the table lean and read performance consistent over time
-
-\- Amazon EventBridge
-
-
-
-EventBridge is fully managed and has no scaling considerations. It reliably triggers Lambda on the configured schedule regardless of system load.
-
-
-
-\- S3 and CloudFront
-
-
-
-The frontend dashboard is served as a static site from S3 via CloudFront.
-
-
-
-\- - CloudFront caches assets at edge locations globally, meaning frontend load times are not affected by backend load
-
-&#x20;   - S3 static hosting scales automatically with no configuration required
-
-&#x20;   - Frontend performance is entirely decoupled from backend scan performance
-
-\- Cold Starts
-
-
-
-A cold start occurs when Lambda has not been invoked recently and AWS needs to initialize a new execution environment before running the function. This adds latency to the first invocation after an idle period.
-
-
-
-Impact on ProfitX\*\*:\*\*
-
-
-
-\- - Scheduled scans trigger at market open after a period of inactivity overnight, making them susceptible to cold starts
-
-&#x20;   - API-facing Lambda functions may experience cold starts if a user is the first to make a request after an idle period
-
-
-
-Mitigation strategies:
-
-
-
-\- - Keep Lambda deployment packages small to reduce initialization time
-
-&#x20;   - Avoid heavy imports and expensive operations outside the handler function
-
-&#x20;   - Use provisioned concurrency on API-facing Lambda functions if cold start latency becomes a measurable problem in production
-
-&#x20;   - Scheduled scans have a wider acceptable completion window, making cold starts less critical for that flow
-
-\- Scalability Limits and Considerations:
-
-
-
-| Consideration                  | Detail                                                                                                                                                              |
-
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-
-| Lambda concurrency limit       | AWS accounts have a default concurrent execution limit of 1,000 per region. This is sufficient for ProfitX at current scale but should be monitored as usage grows. |
-
-| ---                            | ---                                                                                                                                                                 |
-
-| DynamoDB on-demand limits      | On-demand mode handles sudden traffic spikes well but has a default throughput limit that can be raised via AWS support if needed.                                  |
-
-| ---                            | ---                                                                                                                                                                 |
-
-| Market data API rate limits    | The external data provider enforces rate limits per API key. Batch sizes and worker counts must be tuned to stay within those limits.                               |
-
-| ---                            | ---                                                                                                                                                                 |
-
-| EventBridge schedule precision | EventBridge cron schedules are accurate to the minute. Sub-minute scheduling is not supported and is not required for ProfitX.                                      |
-
-| ---                            | ---                                                                                                                                                                 |
-
-
-
-9\\. Security
-
-
-
-\- Authentication \& Authorization
-
-
-
-Amazon cognito - All user authentication is handled by Amazon Cognito. ProfitX does not implement a custom authentication system.
-
-
-
-\- Users authenticate through the Cognito User Pool and receive a JWT access token upon successful login
-
-\- The JWT token expires after a defined period, after which the user must reauthenticate
-
-\- Cognito handles password hashing, token signing, token expiry, and brute force protection natively
-
-\- User identity and credentials are never stored in DynamoDB or Lambda
-
-
-
-API Gateway Authorization - Every API endpoint is protected by a Cognito Authorizer attached to API Gateway.
-
-
-
-\- API Gateway validates the JWT token on every inbound request before it reaches Lambda
-
-\- Requests with missing, expired, or tampered tokens are rejected with 401 Unauthorized at the gateway level
-
-\- Lambda functions never receive unauthenticated requests and do not perform authentication logic themselves
-
-\- This ensures that no compute cost is incurred from unauthenticated or malicious requests
-
-
-
-IAM Least Privilege - Every AWS service interaction is governed by IAM roles and policies. ProfitX follows the principle of least privilege - every component is granted only the permissions it needs and nothing more.
-
-
-
-\- Lambda IAM Roles - Each Lambda function has its own dedicated IAM role. No two functions share a role.
-
-&#x20; - No Lambda function has administrator access
-
-&#x20; - No Lambda function has permissions to IAM, S3 buckets outside its scope, or any service it does not directly interact with
-
-&#x20; - IAM policies are defined in Terraform and version controlled in GitHub
-
-
-
-| Lambda Function   | Permissions Granted                                         |
-
-| ----------------- | ----------------------------------------------------------- |
-
-| Scan Orchestrator | Invoke Lambda, Write to DynamoDB, Read from Secrets Manager |
-
-| ---               | ---                                                         |
-
-| Scanner Worker    | Read from Secrets Manager, Write to DynamoDB                |
-
-| ---               | ---                                                         |
-
-| Results Handler   | Read from DynamoDB                                          |
-
-| ---               | ---                                                         |
-
-| Config Handler    | Read and Write to DynamoDB                                  |
-
-| ---               | ---                                                         |
-
-
-
-\- Why separate roles?
-
-&#x20; - If a single Lambda function is compromised, the blast radius is limited to only the permissions granted to that specific role. A compromised Scanner Worker cannot read user configurations or invoke other Lambda functions because it does not have those permissions.
-
-
-
-Secrets Management - No secrets, API keys, or credentials are ever hardcoded in code or stored in environment variables in plain text.
-
-
-
-\- The market data provider API key is stored in AWS Secrets Manager
-
-\- Lambda functions retrieve the secret at runtime using the Secrets Manager SDK
-
-\- Secrets Manager automatically encrypts stored secrets using AWS KMS
-
-\- Access to Secrets Manager is controlled by IAM - only the Lambda functions that need the API key have permission to retrieve it
-
-\- Secret values never appear in CloudWatch logs, GitHub repositories, or DynamoDB records
-
-
-
-Infrastructure Security
-
-
-
-\- No hardcoded credentials in Terraform
-
-&#x20; - All Terraform configuration files are stored in GitHub. No secrets, account IDs, or sensitive values are hardcoded in Terraform files. Sensitive values are passed in at deploy time via environment variables or retrieved from Secrets Manager.
-
-\- S3 Bucket Security - The S3 bucket used for frontend hosting is configured as follows:
-
-&#x20; - Public access is blocked at the bucket level except for the specific CloudFront distribution serving the frontend
-
-&#x20; - Direct S3 URL access is disabled - all traffic must go through CloudFront
-
-&#x20; - Bucket versioning is enabled to allow recovery from accidental overwrites
-
-\- CloudFront Security
-
-&#x20; - HTTPS is enforced on all CloudFront distributions - HTTP requests are redirected to HTTPS
-
-&#x20; - The frontend is never served over an unencrypted connection
-
-\- DynamoDB Security
-
-&#x20; - All data stored in DynamoDB is encrypted at rest using AWS-managed KMS keys by default
-
-&#x20; - DynamoDB is not publicly accessible - it is only accessible by Lambda functions with the appropriate IAM role
-
-&#x20; - There is no direct database connection string - all access goes through the AWS SDK with IAM authentication
-
-
-
-Logging and Auditability
-
-
-
-\- All Lambda function invocations, errors, and outputs are logged to Amazon CloudWatch Logs automatically
-
-\- CloudWatch logs provide a full audit trail of every scan execution, API request, and system error
-
-\- No sensitive data such as JWT tokens, API keys, or user credentials is written to CloudWatch logs
-
-\- Log retention policies are configured to control storage cost while maintaining an adequate audit window
-
-
-
-CI/CD Pipeline Security
-
-
-
-\- GitHub Actions is used for all deployments - no manual console deployments are permitted
-
-\- AWS credentials used by GitHub Actions are stored as GitHub Secrets and are never exposed in pipeline logs
-
-\- Terraform plans are reviewed before apply to prevent unintended infrastructure changes
-
-\- Branch protection rules are enforced on the main branch to prevent direct pushes without review
-
-
-
-Threat Model Summary
-
-
-
-| Threat                                  | Mitigation                                                 |
-
-| --------------------------------------- | ---------------------------------------------------------- |
-
-| Unauthenticated API access              | Cognito JWT validation enforced at API Gateway             |
-
-| ---                                     | ---                                                        |
-
-| Stolen API key for market data provider | Key stored in Secrets Manager, never in code               |
-
-| ---                                     | ---                                                        |
-
-| Overprivileged Lambda function          | Separate least-privilege IAM role per function             |
-
-| ---                                     | ---                                                        |
-
-| Hardcoded secrets in GitHub             | No secrets in code - enforced by standards and Terraform   |
-
-| ---                                     | ---                                                        |
-
-| Direct database access                  | DynamoDB only accessible via IAM-authenticated Lambda      |
-
-| ---                                     | ---                                                        |
-
-| Unencrypted data at rest                | DynamoDB and S3 encrypted by default with KMS              |
-
-| ---                                     | ---                                                        |
-
-| Unencrypted data in transit             | HTTPS enforced on all CloudFront and API Gateway endpoints |
-
-| ---                                     | ---                                                        |
-
-| Accidental infrastructure change        | All infra defined in Terraform, reviewed before deploy     |
-
-| ---                                     | ---                                                        |
-
-
-
-10\\. Trade Offs
-
-
-
-| Decision                  | Chosen                     | Alternative considered       | Why Chosen                                                                                    | What was accepted                                                    |
-
-| ------------------------- | -------------------------- | ---------------------------- | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-
-| Compute                   | AWS Lambda (serverless)    | EC2 / traditional server     | Zero idle cost, auto-scaling, no server management                                            | Cold starts on first invocation after idle period                    |
-
-| ---                       | ---                        | ---                          | ---                                                                                           | ---                                                                  |
-
-| Database                  | Amazon DynamoDB            | Amazon RDS PostgreSQL        | Fully serverless, no idle instance cost, scales automatically, fits key-based access patterns | Access patterns must be defined upfront - no flexible ad hoc queries |
-
-| ---                       | ---                        | ---                          | ---                                                                                           | ---                                                                  |
-
-| Table design              | Single-table DynamoDB      | Multi-table DynamoDB         | Fewer read operations, lower cost, better performance for related data                        | Higher upfront design complexity                                     |
-
-| ---                       | ---                        | ---                          | ---                                                                                           | ---                                                                  |
-
-| Scan execution            | Asynchronous with polling  | Synchronous request-response | Eliminates API Gateway 29 second timeout risk, enables Lambda fan-out and parallel execution  | Frontend must implement polling logic - results are not instant      |
-
-| ---                       | ---                        | ---                          | ---                                                                                           | ---                                                                  |
-
-| API style                 | REST via API Gateway       | GraphQL                      | Simple, well understood, natively supported by API Gateway, no additional tooling required    | Fixed response shapes - may return more data than strictly needed    |
-
-| ---                       | ---                        | ---                          | ---                                                                                           | ---                                                                  |
-
-| Infrastructure deployment | Terraform (IaC)            | AWS Console                  | Repeatable, version controlled, dev and prod parity, full audit trail in GitHub               | Steeper learning curve, slower for small one-off changes             |
-
-| ---                       | ---                        | ---                          | ---                                                                                           | ---                                                                  |
-
-| Authentication            | Amazon Cognito             | Custom auth system           | Fully managed, handles token signing, expiry, and brute force protection natively             | Less control over custom auth flows                                  |
-
-| ---                       | ---                        | ---                          | ---                                                                                           | ---                                                                  |
-
-| Secret storage            | AWS Secrets Manager        | Environment variables        | Secrets encrypted at rest, access controlled by IAM, never exposed in code or logs            | Small additional latency on Lambda cold start to retrieve secret     |
-
-| ---                       | ---                        | ---                          | ---                                                                                           | ---                                                                  |
-
-| Frontend hosting          | S3 + CloudFront            | EC2 hosted frontend          | Zero server cost, global CDN, scales automatically, fully decoupled from backend              | Limited to static assets - no server side rendering                  |
-
-| ---                       | ---                        | ---                          | ---                                                                                           | ---                                                                  |
-
-| CI/CD                     | GitHub Actions + Terraform | Manual deployments           | Automated, repeatable, no console-click deployments, changes reviewed before apply            | Requires pipeline configuration and maintenance                      |
-
-| ---                       | ---                        | ---                          | ---                                                                                           | ---                                                                  |
-
+```mermaid
+flowchart LR
+  PR[Pull request] --> CI[ci.yml: pytest, fmt, validate, gitleaks]
+  DEV[push to dev] --> D1[deploy.yml: test, plan, apply]
+  MAIN[push to main] --> D2[deploy.yml: test, plan, apply]
+  D1 -->|OIDC role| AWSD[(AWS: dev)]
+  D2 -->|OIDC role| AWSP[(AWS: prod)]
+```
+
+## 9. Security
+
+**Authentication and authorization**
+- Cognito issues JWTs; API Gateway enforces them before Lambda runs
+- No public sign-up; an admin creates users
+- The user's identity (`sub` claim) comes from the verified token, never from the request body
+
+**IAM (least privilege)**
+
+| Role | Allowed actions | Resources |
+|---|---|---|
+| scanner | `dynamodb:PutItem`, `BatchWriteItem` | The one table |
+| | `secretsmanager:GetSecretValue` | The one secret |
+| | `logs:CreateLogStream`, `PutLogEvents` | Its own log group |
+| results | `dynamodb:Query` | The table and `gsi1` |
+| | `logs:CreateLogStream`, `PutLogEvents` | Its own log group |
+| scheduler | `lambda:InvokeFunction` | The scanner only |
+| GitHub deploy | Broad (Terraform creates IAM and many services) | Limited by trust policy to this repo, `dev` and `main` branches |
+
+**Data protection**
+- DynamoDB and S3 are encrypted at rest with default AWS-owned keys
+- HTTPS only on CloudFront and API Gateway
+- S3 bucket is fully private with public access blocked
+- Terraform state is in a versioned, private S3 bucket
+
+**Secrets**
+- The API key lives only in Secrets Manager. Terraform creates the empty secret so the key never lands in Terraform state or Git
+- The Lambda environment holds the secret's ARN, not its value
+- `gitleaks` scans pull requests for committed secrets
+
+**Input validation**
+- Filter keys are allow-listed; values must be numeric and non-negative
+
+**Known gaps** (see section 15): broad CI role, no WAF, no per-user rate limiting beyond API-wide throttling.
+
+## 10. Scalability and Performance
+
+| Dimension | Current behavior | Limit and plan |
+|---|---|---|
+| **Users** | API Gateway and Lambda scale automatically | Throttle is 10 req/s; raise as needed. Cache `GET /scans/latest` if read traffic grows |
+| **Symbols per scan** | Sequential fetches in one Lambda | Roughly 25 to 40 symbols per scan with a real API (two calls per symbol, 25 s limit). Beyond that, use the fan-out design below |
+| **Storage** | On-demand DynamoDB, 30-day TTL | Effectively unbounded; cost grows with writes |
+| **Cold starts** | Python 3.12, no third-party dependencies, clients created at module level | Typically hundreds of milliseconds on first call. Provisioned concurrency was rejected as not worth the cost |
+| **Availability** | Multi-AZ managed services | Single region. Multi-region is out of scope |
+
+**Target design for large symbol lists:** an orchestrator Lambda splits the list into batches, invokes worker Lambdas asynchronously in parallel, and records a job with a status. The API returns a job ID immediately and the dashboard polls. This removes the API Gateway timeout constraint and shortens scan time roughly in proportion to the number of workers.
+
+## 11. Reliability, Observability, and Operations
+
+**Logging.** Both Lambdas emit structured JSON log events (`scan_complete`, `results_read`) plus stack traces for failed fetches. Log groups are created by Terraform with 14-day retention.
+
+**Alarms** (CloudWatch, notifying an SNS topic):
+- scanner Lambda errors >= 1 in 5 minutes
+- results Lambda errors >= 1 in 5 minutes
+- API Gateway 5xx >= 1 in 5 minutes
+
+**Failure handling**
+- A failed fetch for one symbol is logged and counted in `errors`; the scan continues
+- Symbols with missing or invalid data are skipped by the filters rather than raising
+- Provider HTTP calls use an 8-second timeout
+
+**Backups and recovery.** DynamoDB point-in-time recovery is enabled in prod. All infrastructure can be rebuilt from Terraform (`terraform destroy` then `apply`).
+
+**Rollback.** Revert the commit and push; the pipeline redeploys the previous code.
+
+**Testing.** pytest unit tests cover the filters (including threshold edges and bad data). Handler tests use `moto` to simulate DynamoDB.
+
+## 12. Environments
+
+| | dev | prod |
+|---|---|---|
+| Terraform vars | `envs/dev.tfvars` | `envs/prod.tfvars` |
+| State key | `profitx/dev.tfstate` | `profitx/prod.tfstate` |
+| Scheduled scan | Disabled | Enabled |
+| DynamoDB PITR | Off | On |
+| Deploy trigger | Push to `dev` | Push to `main` |
+
+## 13. Cost
+
+Estimated at roughly $1 to $2 per month with both environments deployed, dominated by Secrets Manager ($0.40 per secret per month). Lambda, API Gateway, DynamoDB, Cognito, CloudFront, and EventBridge sit in free tiers or round to pennies at this scale. See `docs/cost-breakdown.md` for assumptions, per-service estimates, and scale scenarios.
+
+Cost controls: on-demand billing, 14-day log retention, API throttling, 30-day TTL, and an AWS Budget alert. Deliberately avoided: NAT Gateway, WAF, provisioned concurrency, customer-managed KMS keys, and RDS.
+
+## 14. Key Design Decisions
+
+| Decision | Chosen | Alternative | Why |
+|---|---|---|---|
+| Compute | Lambda | EC2 / containers | Bursty workload; pay per invocation; no servers to patch |
+| Database | DynamoDB | RDS PostgreSQL | Simple key-based access; no idle cost; no instance to manage |
+| Table design | Single table | One table per entity | Fewer reads, lower cost; keys derived from access patterns |
+| API type | HTTP API | REST API | Cheaper, simpler, native JWT authorizer |
+| API style | REST | GraphQL | Simple, consistent data needs |
+| Auth | Cognito | Custom auth | Managed passwords, tokens, and brute-force protection |
+| Scan execution (v1) | Synchronous | Asynchronous | Small symbol list fits the time limit; simpler |
+| Scheduler | EventBridge Scheduler | Classic EventBridge rule | Time-zone support survives daylight saving |
+| Secrets | Secrets Manager | Environment variables | Encrypted, IAM-controlled, rotatable |
+| Frontend hosting | S3 + CloudFront | Server | No server cost; global CDN |
+| IaC | Terraform | Console clicks | Repeatable, reviewable, identical environments |
+| CI auth to AWS | GitHub OIDC | Stored access keys | Short-lived credentials; nothing to leak |
+| Frontend auth flow | `USER_PASSWORD_AUTH` | SRP / hosted UI with PKCE | Simplest for a static page |
+| Market data | Pluggable providers (mock, FMP) | Hard-coded provider | Develop for free; swap providers by editing one class |
+
+## 15. Risks and Limitations
+
+| Risk | Impact | Mitigation / next step |
+|---|---|---|
+| Market data API limits and float availability | Free tiers may rate-limit or lack float data | Provider interface isolates the change; mock provider for development; verify FMP field names before relying on it |
+| Synchronous scan timeout | Large lists fail past ~30 s | Move to async fan-out |
+| Broad CI deploy role | Compromise of the repo's `main` or `dev` branch could affect the AWS account | Tight OIDC trust; add scoped policy and a manual approval gate for prod |
+| Direct password flow in browser | Less robust than SRP/PKCE | Move to hosted UI with PKCE |
+| Single region | Regional outage means downtime | Acceptable for current scope |
+| Scheduled scan fires at 9:35 AM ET even on market holidays | Wasted invocation, empty or stale data | Add a holiday check |
+| No dead-letter queue | A failed scheduled run is only visible via the alarm | Add DLQ or on-failure destination |
+
+## 16. Future Work
+
+1. Orchestrator and parallel worker Lambdas with async job IDs and polling
+2. Saved scan configurations (`/configs` endpoints, per-user storage)
+3. `GET /scans` and `GET /scans/{scanId}` for history
+4. React dashboard
+5. Terraform modules per service
+6. Shared Lambda layer for common utilities
+7. Manual approval gate and scoped IAM for CI deploys
+8. Dead-letter queues, market-holiday awareness, and a CloudWatch dashboard
+9. AI-generated setup summaries (stretch goal)
+chitecture-design-document.md…]()
